@@ -3,7 +3,7 @@ trader.py - Round 2 双股票量化交易策略（v3稳定版）
 
 策略：
 1. INTARIAN_PEPPER_ROOT - 趋势动量策略（核心）
-2. ASH_COATED_OSMIUM - 禁用（交易成本过高）
+2. ASH_COATED_OSMIUM - 禁用
 
 仓位限制：每只股票 ≤ 80
 """
