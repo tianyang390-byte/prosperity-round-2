@@ -1,11 +1,7 @@
 """
-trader.py - Round 2 双股票量化交易策略（v3稳定版）
+trader.py - Round 2 双股票量化交易策略（v13复制版）
 
-策略：
-1. INTARIAN_PEPPER_ROOT - 趋势动量策略（核心）
-2. ASH_COATED_OSMIUM - 禁用
-
-仓位限制：每只股票 ≤ 80
+完全复制276946的策略，只做INTARIAN趋势动量策略
 """
 
 from datamodel import OrderDepth, TradingState, Order
@@ -29,7 +25,6 @@ INTARIAN_MAX_POSITION = 80
 # ============== 工具函数 ==============
 
 def get_mid_price(order_depth: OrderDepth) -> float:
-    """计算订单簿中间价"""
     if not order_depth.buy_orders or not order_depth.sell_orders:
         return 0.0
     best_bid = max(order_depth.buy_orders.keys())
@@ -38,7 +33,6 @@ def get_mid_price(order_depth: OrderDepth) -> float:
 
 
 def get_best_bid_ask(order_depth: OrderDepth) -> tuple:
-    """获取最优买卖价"""
     if not order_depth.buy_orders or not order_depth.sell_orders:
         return 0, 0
     best_bid = max(order_depth.buy_orders.keys())
@@ -51,11 +45,6 @@ def get_best_bid_ask(order_depth: OrderDepth) -> tuple:
 class MomentumStrategy:
     """
     INTARIAN_PEPPER_ROOT 趋势动量策略
-
-    逻辑：
-    - 金字塔加仓：趋势确认后分批买入
-    - 移动止损：让利润奔跑
-    - 仓位管理：最多80%仓位
     """
 
     def __init__(self):
@@ -68,7 +57,6 @@ class MomentumStrategy:
         self.consecutive_uptrend = 0
 
     def update_history(self, product: str, price: float):
-        """更新价格历史"""
         if price <= 0:
             return
         if product not in self.price_history:
@@ -81,9 +69,6 @@ class MomentumStrategy:
                state: TradingState,
                product: str,
                position: int) -> List[Order]:
-        """
-        生成交易信号
-        """
         orders = []
         od = state.order_depths.get(product)
 
@@ -98,7 +83,6 @@ class MomentumStrategy:
 
         best_bid, best_ask = get_best_bid_ask(od)
 
-        # 初始化
         if product not in self.entry_price:
             self.entry_price[product] = mid_price
         if product not in self.highest_price:
@@ -108,16 +92,13 @@ class MomentumStrategy:
         if len(history) < 5:
             return orders
 
-        # 计算均线
         short_ma = sum(history[-5:]) / 5
         long_ma = sum(history[-10:]) / 10 if len(history) >= 10 else short_ma
 
-        # 趋势判断
         is_uptrend = short_ma > long_ma
         lookback_high = max(history[-INTARIAN_LOOKBACK:]) if len(history) >= INTARIAN_LOOKBACK else max(history)
         is_breakout = mid_price > lookback_high * 0.999
 
-        # 更新连续上升计数
         if is_uptrend:
             self.consecutive_uptrend += 1
         else:
@@ -125,7 +106,7 @@ class MomentumStrategy:
 
         available = self.position_limit - position
 
-        # 入场逻辑：确认上升趋势后买入
+        # 入场
         if position == 0:
             if is_uptrend and self.consecutive_uptrend >= 3:
                 best_ask = min(od.sell_orders.keys())
@@ -135,7 +116,7 @@ class MomentumStrategy:
                     self.entry_price[product] = mid_price
                     self.highest_price[product] = mid_price
 
-        # 加仓逻辑：趋势延续且未满仓
+        # 加仓
         elif 0 < position < self.position_limit:
             if is_uptrend and is_breakout and self.consecutive_uptrend >= 5:
                 best_ask = min(od.sell_orders.keys())
@@ -151,14 +132,12 @@ class MomentumStrategy:
             entry = self.entry_price[product]
             peak = self.highest_price[product]
 
-            # 止损：价格跌破入场价-1.5%
             if mid_price < entry * (1 - INTARIAN_STOP_LOSS_PCT):
                 orders.append(Order(product, int(mid_price), -position))
                 self.entry_price[product] = 0
                 self.consecutive_uptrend = 0
                 return orders
 
-            # 移动止损：从高点回撤超过2.5%则退出
             trailing_stop = peak * (1 - INTARIAN_TRAILING_STOP_PCT)
             if mid_price < trailing_stop:
                 orders.append(Order(product, int(mid_price), -position))
@@ -174,29 +153,23 @@ class MomentumStrategy:
 class Trader:
 
     def __init__(self):
-        """初始化交易器"""
         self.bid_price = 20
         self.intarian_strategy = MomentumStrategy()
 
     def bid(self) -> int:
-        """Market Access Fee 竞拍价格"""
         return self.bid_price
 
     def run(self, state: TradingState) -> tuple:
-        """主交易逻辑"""
         result = {}
 
-        # 获取当前持仓
         position_intarian = state.position.get(PRODUCT_INTARIAN, 0)
 
-        # INTARIAN 趋势策略
         intarian_orders = self.intarian_strategy.signal(
             state, PRODUCT_INTARIAN, position_intarian
         )
         if intarian_orders:
             result[PRODUCT_INTARIAN] = intarian_orders
 
-        # 返回结果
         conversions = 0
         traderData = ""
 
