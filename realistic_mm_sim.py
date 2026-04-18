@@ -1,5 +1,5 @@
 """
-ASH做市策略 - 真实成本模拟（修复版）
+ASH做市策略 - 动态Fair Value版本（更细粒度）
 """
 
 import json
@@ -10,7 +10,6 @@ from io import StringIO
 from typing import List, Dict
 
 sys.path.insert(0, '/Users/minimx/Downloads/ROUND_2')
-from datamodel import OrderDepth, TradingState, Order
 
 
 def load_ash_data(json_path: str) -> List[dict]:
@@ -36,159 +35,102 @@ def load_ash_data(json_path: str) -> List[dict]:
     return ash_data
 
 
-def create_order_depth(data_row: dict) -> OrderDepth:
-    od = OrderDepth()
+def create_order_depth(data_row: dict) -> tuple:
+    buy_orders = {}
+    sell_orders = {}
+
     if data_row.get('bid_price_1') and data_row.get('bid_volume_1'):
         try:
-            od.buy_orders[int(data_row['bid_price_1'])] = int(data_row['bid_volume_1'])
+            buy_orders[int(data_row['bid_price_1'])] = int(data_row['bid_volume_1'])
         except:
             pass
     if data_row.get('ask_price_1') and data_row.get('ask_volume_1'):
         try:
-            od.sell_orders[int(data_row['ask_price_1'])] = -int(data_row['ask_volume_1'])
+            sell_orders[int(data_row['ask_price_1'])] = -int(data_row['ask_volume_1'])
         except:
             pass
-    return od
+
+    return buy_orders, sell_orders
 
 
-class MarketMaker:
-    """
-    ASH做市商
-    - 挂买单在buy_price
-    - 挂卖单在sell_price
-    - 当市场价触价时自动成交
-    """
-
-    def __init__(self, fair_value: float = 10000, threshold: float = 5,
-                 max_position: int = 30, spread: int = 1):
-        self.fair_value = fair_value
-        self.threshold = threshold  # 偏离多少点时挂单
-        self.max_position = max_position
-        self.spread = spread  # 买卖价差
-
-        self.buy_price = None  # 挂单买入价
-        self.sell_price = None  # 挂单卖出价
-        self.position = 0  # 当前持仓
-        self.cash = 0  # 现金
-        self.trades = 0  # 成交次数
-
-    def compute_orders(self, mid_price: float, buy_orders: dict, sell_orders: dict):
-        """计算应该挂什么单"""
-        orders = []
-
-        # 计算挂单价格
-        bid_price = int(mid_price - self.threshold - self.spread)
-        ask_price = int(mid_price + self.threshold + self.spread)
-
-        available_buy = self.max_position - self.position  # 还能买多少
-        available_sell = self.max_position + self.position  # 还能卖多少（做空）
-
-        # 买单：价格 <= bid_price 时买入
-        if available_buy > 0:
-            # 检查当前是否有更好的买单
-            if self.buy_price is None or bid_price < self.buy_price:
-                # 取消旧买单，挂新买单
-                if self.buy_price is not None:
-                    orders.append(Order('ASH_COATED_OSMIUM', self.buy_price, -self.position))  # 取消旧单
-                orders.append(Order('ASH_COATED_OSMIUM', bid_price, available_buy))
-                self.buy_price = bid_price
-
-        # 卖单：价格 >= ask_price 时卖出
-        if available_sell > 0:
-            if self.sell_price is None or ask_price > self.sell_price:
-                if self.sell_price is not None:
-                    orders.append(Order('ASH_COATED_OSMIUM', self.sell_price, self.position))  # 取消旧单
-                orders.append(Order('ASH_COATED_OSMIUM', ask_price, available_sell))
-                self.sell_price = ask_price
-
-        return orders
-
-    def execute_at_market(self, mid_price: float, buy_orders: dict, sell_orders: dict):
-        """按市场价成交"""
-        # 检查是否被成交
-        trades_made = []
-
-        # 买单被卖单成交（有人卖给我们）
-        if self.buy_price is not None and self.buy_price in sell_orders:
-            qty = min(abs(sell_orders[self.buy_price]), self.max_position - self.position)
-            if qty > 0:
-                self.position += qty
-                self.cash -= self.buy_price * qty
-                self.trades += 1
-                trades_made.append(('BUY', self.buy_price, qty))
-
-        # 卖单被买单成交（有人买我们的）
-        if self.sell_price is not None and self.sell_price in buy_orders:
-            qty = min(abs(buy_orders[self.sell_price]), self.max_position + self.position)
-            if qty > 0:
-                self.position -= qty
-                self.cash += self.sell_price * qty
-                self.trades += 1
-                trades_made.append(('SELL', self.sell_price, qty))
-
-        return trades_made
-
-    def reset(self):
-        self.buy_price = None
-        self.sell_price = None
-        self.position = 0
-        self.cash = 0
-        self.trades = 0
+def calc_fair_value(prices: List[float], idx: int, window: int) -> float:
+    if idx < window:
+        return sum(prices[:idx+1]) / (idx + 1)
+    return sum(prices[idx-window+1:idx+1]) / window
 
 
-def run_backtest(data: List[dict], threshold: float, spread: int = 1,
-                maf_cost: float = 0, maf_trade_limit: int = None) -> dict:
-    """回测做市策略"""
+def simulate_market_making(data: List[dict], fv_window: int, buy_thresh: float,
+                          sell_thresh: float, max_position: int = 30) -> dict:
 
-    mm = MarketMaker(threshold=threshold, spread=spread)
+    prices = [d['mid_price'] for d in data]
 
-    buy_count = 0
-    sell_count = 0
+    position = 0
+    cash = 0
+    buy_trades = 0
+    sell_trades = 0
+    entry_price = 0
+    entry_idx = 0
 
     for i, d in enumerate(data):
         mid_price = d['mid_price']
+        fv = calc_fair_value(prices, i, fv_window)
 
-        # 获取当前簿
-        od = create_order_depth(d)
-        buy_orders = od.buy_orders
-        sell_orders = {k: -v for k, v in od.sell_orders.items()}
+        buy_orders, sell_orders = create_order_depth(d)
 
-        # 检查是否被成交
-        trades = mm.execute_at_market(mid_price, buy_orders, sell_orders)
+        buy_line = fv - buy_thresh
+        sell_line = fv + sell_thresh
 
-        for trade_type, price, qty in trades:
-            if trade_type == 'BUY':
-                buy_count += 1
-            else:
-                sell_count += 1
+        # 买入
+        if position < max_position:
+            if mid_price <= buy_line:
+                if sell_orders:
+                    best_ask = min(sell_orders.keys())
+                    if best_ask <= buy_line + 1:
+                        qty = min(10, max_position - position)
+                        position += qty
+                        cash -= best_ask * qty
+                        buy_trades += 1
+                        entry_price = best_ask
+                        entry_idx = i
 
-        # 更新挂单
-        mm.compute_orders(mid_price, buy_orders, sell_orders)
+        # 卖出
+        if position > 0:
+            if mid_price >= sell_line:
+                if buy_orders:
+                    best_bid = max(buy_orders.keys())
+                    cash += best_bid * position
+                    position = 0
+                    sell_trades += 1
 
-        # 检查MAF限制
-        if maf_trade_limit and mm.trades >= maf_trade_limit:
-            break
+            elif mid_price - entry_price >= sell_thresh:
+                if buy_orders:
+                    best_bid = max(buy_orders.keys())
+                    cash += best_bid * position
+                    position = 0
+                    sell_trades += 1
 
-    # 最终平仓
-    final_price = data[-1]['mid_price']
-    if mm.position > 0:
-        mm.cash += final_price * mm.position
-    elif mm.position < 0:
-        mm.cash += final_price * abs(mm.position)
+            elif entry_price > 0 and mid_price < entry_price * 0.98:
+                if buy_orders:
+                    best_bid = max(buy_orders.keys())
+                    cash += best_bid * position
+                    position = 0
+                    sell_trades += 1
 
-    # 扣除MAF成本
-    net_pnl = mm.cash - maf_cost
+            elif i - entry_idx > 50:
+                if buy_orders:
+                    best_bid = max(buy_orders.keys())
+                    cash += best_bid * position
+                    position = 0
+                    sell_trades += 1
+
+    if position > 0:
+        cash += prices[-1] * position
 
     return {
-        'threshold': threshold,
-        'spread': spread,
-        'trades': mm.trades,
-        'buy_count': buy_count,
-        'sell_count': sell_count,
-        'final_position': mm.position,
-        'gross_pnl': mm.cash,
-        'maf_cost': maf_cost,
-        'net_pnl': net_pnl
+        'buy_trades': buy_trades,
+        'sell_trades': sell_trades,
+        'position': position,
+        'pnl': cash
     }
 
 
@@ -208,7 +150,7 @@ def main():
         datasets.append((folder_name, json_file))
 
     print("=" * 70)
-    print("ASH做市策略 - 真实成本模拟")
+    print("ASH做市策略 - 动态Fair Value细粒度测试")
     print("=" * 70)
 
     all_results = []
@@ -218,29 +160,41 @@ def main():
         if not ash_data:
             continue
 
-        print(f"\n数据集: {folder_name}, 数据点: {len(ash_data)}")
+        print(f"\n数据集: {folder_name}")
 
-        for threshold in [3, 5, 8]:
-            for spread in [1, 2]:
-                r = run_backtest(ash_data, threshold, spread)
-                r['dataset'] = folder_name
-                all_results.append(r)
-                print(f"  阈值={threshold}, spread={spread}: "
-                      f"交易={r['trades']:>3}, 买={r['buy_count']:>3}, 卖={r['sell_count']:>3}, "
-                      f"PnL={r['net_pnl']:>12.0f}")
+        for window in [2, 3, 4, 5, 7, 10, 15, 20]:
+            for buy_th in [2, 3, 4, 5]:
+                for sell_th in [2, 3, 4, 5]:
+                    r = simulate_market_making(ash_data, window, buy_th, sell_th)
+                    r['dataset'] = folder_name
+                    r['window'] = window
+                    r['buy_th'] = buy_th
+                    r['sell_th'] = sell_th
+                    all_results.append(r)
 
     # 汇总
     print("\n" + "=" * 70)
-    print("汇总（4个数据集平均）")
+    print("汇总：最优配置TOP10")
     print("=" * 70)
 
-    for threshold in [3, 5, 8]:
-        for spread in [1, 2]:
-            configs = [r for r in all_results if r['threshold'] == threshold and r['spread'] == spread]
-            if configs:
-                avg_trades = sum(r['trades'] for r in configs) / len(configs)
-                avg_pnl = sum(r['net_pnl'] for r in configs) / len(configs)
-                print(f"阈值={threshold}, spread={spread}: 平均交易={avg_trades:.0f}, 平均PnL={avg_pnl:.0f}")
+    configs = {}
+    for r in all_results:
+        key = (r['window'], r['buy_th'], r['sell_th'])
+        if key not in configs:
+            configs[key] = []
+        configs[key].append(r)
+
+    best_configs = []
+    for key, results in configs.items():
+        avg_pnl = sum(r['pnl'] for r in results) / len(results)
+        avg_trades = sum(r['buy_trades'] + r['sell_trades'] for r in results) / len(results)
+        best_configs.append((*key, avg_pnl, avg_trades))
+
+    best_configs.sort(key=lambda x: -x[4])
+
+    for i, (window, buy_th, sell_th, avg_pnl, avg_trades) in enumerate(best_configs[:10]):
+        print(f"TOP{i+1}: FV_window={window}, buy={buy_th}, sell={sell_th}: "
+              f"平均PnL={avg_pnl:>8.0f}, 平均交易={avg_trades:.0f}")
 
 
 if __name__ == '__main__':
